@@ -34,9 +34,9 @@ SAFETY_MARGIN = 0.10      # запас 0.10%
 MAX_DAILY_LOSS = 5.0      # аварийная остановка при убытке > $5 за день
 MAX_CONSECUTIVE_LOSSES = 5  # остановка после 5 убыточных сделок подряд
 
-# Адреса контрактов (Arbitrum One) - ПРАВИЛЬНЫЕ
+# Адреса контрактов (Arbitrum One) - ИСПРАВЛЕНЫ
 UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-QUOTER_V2 = "0xB27308f9F90D607463bb33eA1BeBb41C27CE5AB6"   # исправленный адрес
+QUOTER_V2 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"   # правильный checksum
 WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
 USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
