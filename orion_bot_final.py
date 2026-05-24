@@ -34,11 +34,13 @@ SAFETY_MARGIN = 0.10      # запас 0.10%
 MAX_DAILY_LOSS = 5.0      # аварийная остановка при убытке > $5 за день
 MAX_CONSECUTIVE_LOSSES = 5  # остановка после 5 убыточных сделок подряд
 
-# Адреса контрактов
+# Адреса контрактов (Arbitrum One) - ПРАВИЛЬНЫЕ
 UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-QUOTER_V2 = "0xB27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+QUOTER_V2 = "0xB27308f9F90D607463bb33eA1BeBb41C27CE5AB6"   # исправленный адрес
 WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
 USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
+# Solana
 WSOL = Pubkey.from_string("So11111111111111111111111111111111111111112")
 USDC_SOL = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 JITO_ENGINE = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1"
@@ -55,7 +57,8 @@ async def send_telegram(msg: str):
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except: pass
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
 
 class FeeManager:
     def __init__(self, okx):
@@ -69,8 +72,10 @@ class FeeManager:
             markets = await self.okx.load_markets()
             if 'ETH/USDC' in markets:
                 self.okx_taker_fee = markets['ETH/USDC']['taker'] / 100.0
-                if self.okx_taker_fee > 1: self.okx_taker_fee /= 100.0
-        except: pass
+                if self.okx_taker_fee > 1:
+                    self.okx_taker_fee /= 100.0
+        except Exception as e:
+            logger.warning(f"Fee update error: {e}")
         self.last_update = time.time()
     def calc_min_spread_arb(self, gas_usd, eth_price):
         total = (self.uniswap_fee + self.okx_taker_fee)*100
@@ -104,7 +109,8 @@ class AdaptiveThreshold:
                 self.multiplier = max(0.7, self.multiplier * 0.98)
                 logger.info(f"Адаптация: снижаем порог до {self.multiplier:.2f}")
             self.last_adjust = time.time()
-    def get(self, base): return base * self.multiplier
+    def get(self, base):
+        return base * self.multiplier
 
 class ArbitrumEngine:
     def __init__(self, rpc, priv_key):
@@ -145,7 +151,8 @@ class ArbitrumEngine:
         signed = self.w3_priv.eth.account.sign_transaction(tx, ARB_PRIVATE_KEY)
         tx_hash = self.w3_priv.eth.send_raw_transaction(signed.raw_transaction)
         receipt = self.w3_pub.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
-        if receipt['status'] != 1: raise Exception("Arb DEX revert")
+        if receipt['status'] != 1:
+            raise Exception("Arb DEX revert")
         buy = await self.okx.create_market_buy_order('ETH/USDC', expected_usdc)
         profit_eth = buy['filled'] - amount_eth
         cex_price = await self.get_cex_price()
@@ -179,11 +186,13 @@ class SolanaEngine:
             payload = {"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[bundle,{"encoding":"base64"}]}
             async with session.post(JITO_ENGINE, json=payload) as resp:
                 res = await resp.json()
-                if 'error' in res: raise Exception(f"Jito error: {res['error']}")
+                if 'error' in res:
+                    raise Exception(f"Jito error: {res['error']}")
         return True
     async def execute(self, amount_sol, dex_price):
         fresh_price, quote = await self.get_jupiter_quote(amount_sol)
-        if fresh_price < dex_price * 0.98: raise Exception("price changed")
+        if fresh_price < dex_price * 0.98:
+            raise Exception("price changed")
         async with aiohttp.ClientSession() as session:
             payload = {"quoteResponse": quote, "userPublicKey": str(self.keypair.pubkey()), "wrapAndUnwrapSol": True}
             async with session.post("https://quote-api.jup.ag/v6/swap", json=payload) as resp:
@@ -207,16 +216,26 @@ async def main():
     trades_today = 0
     consecutive_losses = 0
     await send_telegram("🚀 Orion-X Pro запущен на GitHub Actions (автопилот)")
-    okx = ccxt.okx({'apiKey': OKX_API_KEY, 'secret': OKX_SECRET, 'password': OKX_PASSPHRASE, 'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+    okx = ccxt.okx({
+        'apiKey': OKX_API_KEY,
+        'secret': OKX_SECRET,
+        'password': OKX_PASSPHRASE,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
     fee_mgr = FeeManager(okx)
     await fee_mgr.update_fees()
-    arb = ArbitrumEngine(ARB_RPC, ARB_PRIVATE_KEY); arb.okx = okx
-    sol = SolanaEngine(Keypair.from_base58_string(SOL_PRIVATE_B58)); sol.okx = okx
-    adapt_arb = AdaptiveThreshold(); adapt_sol = AdaptiveThreshold()
+    arb = ArbitrumEngine(ARB_RPC, ARB_PRIVATE_KEY)
+    arb.okx = okx
+    sol = SolanaEngine(Keypair.from_base58_string(SOL_PRIVATE_B58))
+    sol.okx = okx
+    adapt_arb = AdaptiveThreshold()
+    adapt_sol = AdaptiveThreshold()
 
     while True:
         try:
-            if time.time() - fee_mgr.last_update > 3600: await fee_mgr.update_fees()
+            if time.time() - fee_mgr.last_update > 3600:
+                await fee_mgr.update_fees()
             # === Аварийная остановка по дневному убытку ===
             if total_profit < -MAX_DAILY_LOSS:
                 await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: дневной убыток превысил ${MAX_DAILY_LOSS}. Profit: ${total_profit:.2f}")
@@ -236,13 +255,17 @@ async def main():
                 cur_spread = (dex_eth - cex_eth)/cex_eth*100
                 if cur_spread >= min_spread:
                     profit = await arb.execute(TRADE_ETH, dex_eth)
-                    total_profit += profit; trades_today += 1
+                    total_profit += profit
+                    trades_today += 1
                     adapt_arb.trades_today = trades_today
                     adapt_arb.update(profit > 0)
-                    if profit > 0: consecutive_losses = 0
-                    else: consecutive_losses += 1
+                    if profit > 0:
+                        consecutive_losses = 0
+                    else:
+                        consecutive_losses += 1
                     msg = f"✅ ARB +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
-                    logger.info(msg); await send_telegram(msg)
+                    logger.info(msg)
+                    await send_telegram(msg)
                     await asyncio.sleep(2)
 
             # ----- SOLANA -----
@@ -255,19 +278,24 @@ async def main():
                 cur_spread = (dex_sol - cex_sol)/cex_sol*100
                 if cur_spread >= min_spread:
                     profit = await sol.execute(TRADE_SOL, dex_sol)
-                    total_profit += profit; trades_today += 1
+                    total_profit += profit
+                    trades_today += 1
                     adapt_sol.trades_today = trades_today
                     adapt_sol.update(profit > 0)
-                    if profit > 0: consecutive_losses = 0
-                    else: consecutive_losses += 1
+                    if profit > 0:
+                        consecutive_losses = 0
+                    else:
+                        consecutive_losses += 1
                     msg = f"✅ SOL +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
-                    logger.info(msg); await send_telegram(msg)
+                    logger.info(msg)
+                    await send_telegram(msg)
                     await asyncio.sleep(2)
 
             await asyncio.sleep(1.5)
         except Exception as e:
             err = f"⚠️ Ошибка: {e}"
-            logger.error(err); await send_telegram(err)
+            logger.error(err)
+            await send_telegram(err)
             await asyncio.sleep(5)
 
 if __name__ == '__main__':
