@@ -1,0 +1,30 @@
+name: 'Orion-X Pro – Автоматический арбитраж'
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  arbitrage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Клонируем код
+        uses: actions/checkout@v4
+      - name: Устанавливаем Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Устанавливаем зависимости
+        run: pip install -r requirements.txt
+      - name: Запускаем бота
+        run: python orion_bot_final.py
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET: ${{ secrets.OKX_SECRET }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          ARB_RPC: ${{ secrets.ARB_RPC }}
+          ARB_PRIVATE_KEY: ${{ secrets.ARB_PRIVATE_KEY }}
+          SOL_PRIVATE_B58: ${{ secrets.SOL_PRIVATE_B58 }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
