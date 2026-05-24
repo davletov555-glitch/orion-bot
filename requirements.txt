@@ -1,0 +1,6 @@
+web3
+solana
+solders
+ccxt
+aiohttp
+python-telegram-bot
