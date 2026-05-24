@@ -4,17 +4,9 @@
 import os
 import asyncio
 import time
-import base64
 import logging
 from web3 import Web3
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Processed
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from solders.system_program import transfer as system_transfer
-import aiohttp
 import ccxt.async_support as ccxt
-import socket
 
 # ==== КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====
 OKX_API_KEY = os.getenv('OKX_API_KEY')
@@ -22,32 +14,24 @@ OKX_SECRET = os.getenv('OKX_SECRET')
 OKX_PASSPHRASE = os.getenv('OKX_PASSPHRASE')
 ARB_RPC = os.getenv('ARB_RPC')
 ARB_PRIVATE_KEY = os.getenv('ARB_PRIVATE_KEY')
-SOL_PRIVATE_B58 = os.getenv('SOL_PRIVATE_B58')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # ==== НАСТРОЙКИ ====
-TRADE_ETH = 0.02
-TRADE_SOL = 0.25
-MAX_SLIPPAGE = 0.25
-JITO_TIP_LAMPORTS = 5_000_000
+TRADE_ETH = 0.02          # $50
+MAX_SLIPPAGE = 0.25       # 0.25%
 SAFETY_MARGIN = 0.10
 MAX_DAILY_LOSS = 5.0
 MAX_CONSECUTIVE_LOSSES = 5
 MAX_RUNTIME_SECONDS = 600  # 10 минут работы
 
-# Адреса контрактов
+# Адреса контрактов (Arbitrum One)
 UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-QUOTER_V1 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
 WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
 USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
-WSOL = Pubkey.from_string("So11111111111111111111111111111111111111112")
-USDC_SOL = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-JITO_ENGINE = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1"
-SOL_RPC = "https://api.mainnet-beta.solana.com"
-
-# ABI Quoter V1 (только amountOut)
+# ABI
 QUOTER_ABI = [{
     "inputs": [
         {"internalType": "bytes", "name": "path", "type": "bytes"},
@@ -94,7 +78,6 @@ class FeeManager:
         self.okx = okx
         self.okx_taker_fee = 0.0010
         self.uniswap_fee = 0.0005
-        self.jupiter_fee = 0.0010
         self.last_update = 0
     async def update_fees(self):
         try:
@@ -103,18 +86,12 @@ class FeeManager:
                 self.okx_taker_fee = markets['ETH/USDC']['taker'] / 100.0
                 if self.okx_taker_fee > 1:
                     self.okx_taker_fee /= 100.0
-        except:
-            pass
+        except: pass
         self.last_update = time.time()
-    def calc_min_spread_arb(self, gas_usd, eth_price):
-        total = (self.uniswap_fee + self.okx_taker_fee)*100
-        gas_pct = (gas_usd/(TRADE_ETH*eth_price))*100 if eth_price else 0
+    def calc_min_spread(self, gas_usd, eth_price):
+        total = (self.uniswap_fee + self.okx_taker_fee) * 100
+        gas_pct = (gas_usd / (TRADE_ETH * eth_price)) * 100 if eth_price else 0
         return max(total + gas_pct + SAFETY_MARGIN, 0.20)
-    def calc_min_spread_sol(self, gas_usd, sol_price):
-        total = (self.jupiter_fee + self.okx_taker_fee)*100
-        jito_pct = (JITO_TIP_LAMPORTS/1e9*sol_price)/(TRADE_SOL*sol_price)*100 if sol_price else 0
-        gas_pct = (gas_usd/(TRADE_SOL*sol_price))*100 if sol_price else 0
-        return max(total + jito_pct + gas_pct + SAFETY_MARGIN, 0.20)
 
 class AdaptiveThreshold:
     def __init__(self):
@@ -148,7 +125,7 @@ class ArbitrumEngine:
         self.account = self.w3_priv.eth.account.from_key(priv_key)
         self.wallet = self.account.address
         self.router = self.w3_priv.eth.contract(address=UNISWAP_V3_ROUTER, abi=ROUTER_ABI)
-        self.quoter = self.w3_pub.eth.contract(address=QUOTER_V1, abi=QUOTER_ABI)
+        self.quoter = self.w3_pub.eth.contract(address=QUOTER, abi=QUOTER_ABI)
         self.okx = None
     def encode_path(self, tokens, fees):
         packed = b''
@@ -192,75 +169,12 @@ class ArbitrumEngine:
         ob = await self.okx.fetch_order_book('ETH/USDC', limit=5)
         return float(ob['bids'][0][0])
 
-class SolanaEngine:
-    def __init__(self, keypair):
-        self.client = AsyncClient(SOL_RPC, commitment=Processed)
-        self.keypair = keypair
-        self.okx = None
-    async def get_jupiter_quote(self, amount_sol, retries=3):
-        # Кастомный DNS резолвер (8.8.8.8) и таймаут
-        connector = aiohttp.TCPConnector(
-            resolver=aiohttp.resolver.AsyncResolver(nameservers=["8.8.8.8", "8.8.4.4"]),
-            ttl_dns_cache=300
-        )
-        for attempt in range(retries):
-            try:
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    url = f"https://quote-api.jup.ag/v6/quote?inputMint={WSOL}&outputMint={USDC_SOL}&amount={int(amount_sol*1e9)}&slippageBps={MAX_SLIPPAGE*100}"
-                    async with session.get(url, timeout=10) as resp:
-                        data = await resp.json()
-                        price = float(data['outAmount']) / 1e6 / amount_sol
-                        return price, data
-            except Exception as e:
-                logger.warning(f"Jupiter quote attempt {attempt+1} failed: {e}")
-                if attempt == retries-1:
-                    raise
-                await asyncio.sleep(2)
-        raise Exception("Jupiter quote failed after retries")
-    async def send_jito_bundle(self, swap_tx_bytes):
-        tip_acc = Pubkey.from_string("Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY")
-        tip_ix = system_transfer(self.keypair.pubkey(), tip_acc, JITO_TIP_LAMPORTS)
-        swap_txn = Transaction.deserialize(swap_tx_bytes)
-        combined = list(swap_txn.instructions) + [tip_ix]
-        blockhash = await self.client.get_latest_blockhash()
-        new_txn = Transaction.new(combined, blockhash.value.blockhash, self.keypair)
-        new_txn.sign(self.keypair)
-        bundle = [base64.b64encode(new_txn.serialize()).decode()]
-        async with aiohttp.ClientSession() as session:
-            payload = {"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[bundle,{"encoding":"base64"}]}
-            async with session.post(JITO_ENGINE, json=payload, timeout=10) as resp:
-                res = await resp.json()
-                if 'error' in res:
-                    raise Exception(f"Jito error: {res['error']}")
-        return True
-    async def execute(self, amount_sol, dex_price):
-        fresh_price, quote = await self.get_jupiter_quote(amount_sol)
-        if fresh_price < dex_price * 0.98:
-            raise Exception("price changed")
-        async with aiohttp.ClientSession() as session:
-            payload = {"quoteResponse": quote, "userPublicKey": str(self.keypair.pubkey()), "wrapAndUnwrapSol": True}
-            async with session.post("https://quote-api.jup.ag/v6/swap", json=payload, timeout=10) as resp:
-                swap_data = await resp.json()
-                tx_bytes = base64.b64decode(swap_data['swapTransaction'])
-        await self.send_jito_bundle(tx_bytes)
-        usdc_received = amount_sol * dex_price
-        buy = await self.okx.create_market_buy_order('SOL/USDC', usdc_received)
-        profit_sol = buy['filled'] - amount_sol
-        cex_price = await self.get_cex_price()
-        return profit_sol * cex_price
-    async def get_cex_price(self):
-        ob = await self.okx.fetch_order_book('SOL/USDC', limit=5)
-        return float(ob['bids'][0][0])
-    async def get_gas_price_usd(self):
-        return ((5000 + JITO_TIP_LAMPORTS) / 1e9) * (await self.get_cex_price())
-
 async def main():
-    global total_profit, trades_today
     total_profit = 0.0
     trades_today = 0
     consecutive_losses = 0
     start_time = time.time()
-    await send_telegram("🚀 Orion-X Pro запущен на GitHub Actions (DNS fix, таймаут 10 мин)")
+    await send_telegram("🚀 Orion-X Pro (только Arbitrum) запущен на GitHub Actions")
     okx = ccxt.okx({
         'apiKey': OKX_API_KEY,
         'secret': OKX_SECRET,
@@ -272,14 +186,10 @@ async def main():
     await fee_mgr.update_fees()
     arb = ArbitrumEngine(ARB_RPC, ARB_PRIVATE_KEY)
     arb.okx = okx
-    sol = SolanaEngine(Keypair.from_base58_string(SOL_PRIVATE_B58))
-    sol.okx = okx
-    adapt_arb = AdaptiveThreshold()
-    adapt_sol = AdaptiveThreshold()
+    adapt = AdaptiveThreshold()
 
     while True:
         try:
-            # Проверка времени
             if time.time() - start_time > MAX_RUNTIME_SECONDS:
                 await send_telegram("⏱️ Лимит времени 10 мин, завершение")
                 logger.info("Timeout reached, exiting")
@@ -294,63 +204,36 @@ async def main():
                 await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: {MAX_CONSECUTIVE_LOSSES} убыточных сделок")
                 break
 
-            # ----- Arbitrum -----
-            cex_eth = await arb.get_cex_price()
-            dex_eth, _ = await arb.get_dex_price(TRADE_ETH)
-            if dex_eth and cex_eth and dex_eth > cex_eth:
+            cex = await arb.get_cex_price()
+            dex, _ = await arb.get_dex_price(TRADE_ETH)
+            if dex and cex and dex > cex:
                 gas_usd = await arb.get_gas_price_usd()
-                base = fee_mgr.calc_min_spread_arb(gas_usd, cex_eth)
-                min_spread = adapt_arb.get(base)
-                cur_spread = (dex_eth - cex_eth)/cex_eth*100
+                base = fee_mgr.calc_min_spread(gas_usd, cex)
+                min_spread = adapt.get(base)
+                cur_spread = (dex - cex) / cex * 100
                 if cur_spread >= min_spread:
-                    profit = await arb.execute(TRADE_ETH, dex_eth)
+                    profit = await arb.execute(TRADE_ETH, dex)
                     total_profit += profit
                     trades_today += 1
-                    adapt_arb.trades_today = trades_today
-                    adapt_arb.update(profit > 0)
-                    if profit > 0: consecutive_losses = 0
-                    else: consecutive_losses += 1
+                    adapt.trades_today = trades_today
+                    adapt.update(profit > 0)
+                    if profit > 0:
+                        consecutive_losses = 0
+                    else:
+                        consecutive_losses += 1
                     msg = f"✅ ARB +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
                     logger.info(msg)
                     await send_telegram(msg)
                     await asyncio.sleep(2)
 
-            # ----- Solana (с защитой от DNS ошибок) -----
-            try:
-                cex_sol = await sol.get_cex_price()
-                dex_sol, _ = await sol.get_jupiter_quote(TRADE_SOL)
-                if dex_sol and cex_sol and dex_sol > cex_sol:
-                    gas_usd = await sol.get_gas_price_usd()
-                    base = fee_mgr.calc_min_spread_sol(gas_usd, cex_sol)
-                    min_spread = adapt_sol.get(base)
-                    cur_spread = (dex_sol - cex_sol)/cex_sol*100
-                    if cur_spread >= min_spread:
-                        profit = await sol.execute(TRADE_SOL, dex_sol)
-                        total_profit += profit
-                        trades_today += 1
-                        adapt_sol.trades_today = trades_today
-                        adapt_sol.update(profit > 0)
-                        if profit > 0: consecutive_losses = 0
-                        else: consecutive_losses += 1
-                        msg = f"✅ SOL +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
-                        logger.info(msg)
-                        await send_telegram(msg)
-                        await asyncio.sleep(2)
-            except Exception as sol_err:
-                logger.warning(f"Solana временная ошибка (пропускаем): {sol_err}")
-
             await asyncio.sleep(1.5)
-
         except Exception as e:
             err = f"⚠️ Ошибка: {e}"
             logger.error(err)
             await send_telegram(err)
             await asyncio.sleep(5)
 
-    # Закрытие ресурсов
     await okx.close()
-    await arb.w3_priv.provider.cache_clear()
-    await sol.client.close()
     logger.info("Бот завершил работу")
 
 if __name__ == '__main__':
@@ -358,4 +241,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
-        asyncio.run(send_telegram("⏹️ Бот остановлен"))
