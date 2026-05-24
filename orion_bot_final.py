@@ -14,6 +14,7 @@ from solders.pubkey import Pubkey
 from solders.system_program import transfer as system_transfer
 import aiohttp
 import ccxt.async_support as ccxt
+import socket
 
 # ==== КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====
 OKX_API_KEY = os.getenv('OKX_API_KEY')
@@ -33,12 +34,11 @@ JITO_TIP_LAMPORTS = 5_000_000
 SAFETY_MARGIN = 0.10
 MAX_DAILY_LOSS = 5.0
 MAX_CONSECUTIVE_LOSSES = 5
-MAX_RUNTIME_SECONDS = 600  # 10 минут работы в GitHub Actions
+MAX_RUNTIME_SECONDS = 600  # 10 минут работы
 
 # Адреса контрактов
 UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-QUOTER_V2 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
-QUOTER_V1 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"  # тот же, но используем ABI разный
+QUOTER_V1 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
 WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
 USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
@@ -47,31 +47,14 @@ USDC_SOL = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 JITO_ENGINE = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1"
 SOL_RPC = "https://api.mainnet-beta.solana.com"
 
-# ABI Quoter V1 (возвращает только uint256 amountOut)
-QUOTER_ABI_V1 = [{
+# ABI Quoter V1 (только amountOut)
+QUOTER_ABI = [{
     "inputs": [
         {"internalType": "bytes", "name": "path", "type": "bytes"},
         {"internalType": "uint256", "name": "amountIn", "type": "uint256"}
     ],
     "name": "quoteExactInput",
     "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
-    "stateMutability": "view",
-    "type": "function"
-}]
-
-# ABI Quoter V2 (4 значения)
-QUOTER_ABI_V2 = [{
-    "inputs": [
-        {"internalType": "bytes", "name": "path", "type": "bytes"},
-        {"internalType": "uint256", "name": "amountIn", "type": "uint256"}
-    ],
-    "name": "quoteExactInput",
-    "outputs": [
-        {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
-        {"internalType": "uint160[]", "name": "sqrtPriceX96AfterList", "type": "uint160[]"},
-        {"internalType": "uint32[]", "name": "initializedTicksCrossedList", "type": "uint32[]"},
-        {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"}
-    ],
     "stateMutability": "view",
     "type": "function"
 }]
@@ -118,8 +101,10 @@ class FeeManager:
             markets = await self.okx.load_markets()
             if 'ETH/USDC' in markets:
                 self.okx_taker_fee = markets['ETH/USDC']['taker'] / 100.0
-                if self.okx_taker_fee > 1: self.okx_taker_fee /= 100.0
-        except: pass
+                if self.okx_taker_fee > 1:
+                    self.okx_taker_fee /= 100.0
+        except:
+            pass
         self.last_update = time.time()
     def calc_min_spread_arb(self, gas_usd, eth_price):
         total = (self.uniswap_fee + self.okx_taker_fee)*100
@@ -153,7 +138,8 @@ class AdaptiveThreshold:
                 self.multiplier = max(0.7, self.multiplier * 0.98)
                 logger.info(f"Адаптация: снижаем порог до {self.multiplier:.2f}")
             self.last_adjust = time.time()
-    def get(self, base): return base * self.multiplier
+    def get(self, base):
+        return base * self.multiplier
 
 class ArbitrumEngine:
     def __init__(self, rpc, priv_key):
@@ -162,10 +148,7 @@ class ArbitrumEngine:
         self.account = self.w3_priv.eth.account.from_key(priv_key)
         self.wallet = self.account.address
         self.router = self.w3_priv.eth.contract(address=UNISWAP_V3_ROUTER, abi=ROUTER_ABI)
-        # Пробуем Quoter V2, если не получится – используем V1
-        self.quoter_v2 = self.w3_pub.eth.contract(address=QUOTER_V2, abi=QUOTER_ABI_V2)
-        self.quoter_v1 = self.w3_pub.eth.contract(address=QUOTER_V2, abi=QUOTER_ABI_V1)
-        self.use_v2 = True
+        self.quoter = self.w3_pub.eth.contract(address=QUOTER_V1, abi=QUOTER_ABI)
         self.okx = None
     def encode_path(self, tokens, fees):
         packed = b''
@@ -177,23 +160,9 @@ class ArbitrumEngine:
     async def get_dex_price(self, amount_eth):
         wei = self.w3_pub.to_wei(amount_eth, 'ether')
         path = self.encode_path([WETH, USDC_ARB], [500])
-        try:
-            if self.use_v2:
-                res = self.quoter_v2.functions.quoteExactInput(path, wei).call()
-                usdc_out = res[0] / 10**6
-                gas_est = res[3]
-                return usdc_out / amount_eth, gas_est
-            else:
-                res = self.quoter_v1.functions.quoteExactInput(path, wei).call()
-                usdc_out = res / 10**6
-                return usdc_out / amount_eth, 0
-        except Exception as e:
-            if self.use_v2:
-                logger.warning(f"Quoter V2 failed, switching to V1: {e}")
-                self.use_v2 = False
-                return await self.get_dex_price(amount_eth)
-            else:
-                raise e
+        res = self.quoter.functions.quoteExactInput(path, wei).call()
+        usdc_out = res / 10**6
+        return usdc_out / amount_eth, 0
     async def get_gas_price_usd(self):
         gas_price_gwei = self.w3_pub.eth.gas_price / 1e9
         eth_price = await self.get_cex_price()
@@ -204,14 +173,17 @@ class ArbitrumEngine:
         min_usdc = int(expected_usdc * (1 - MAX_SLIPPAGE/100) * 10**6)
         path = self.encode_path([WETH, USDC_ARB], [500])
         tx = self.router.functions.exactInput((path, self.wallet, int(time.time())+60, wei, min_usdc)).build_transaction({
-            'from': self.wallet, 'value': wei, 'gas': 850000,
+            'from': self.wallet,
+            'value': wei,
+            'gas': 850000,
             'gasPrice': int(self.w3_priv.eth.gas_price * 1.05),
             'nonce': self.w3_priv.eth.get_transaction_count(self.wallet)
         })
         signed = self.w3_priv.eth.account.sign_transaction(tx, ARB_PRIVATE_KEY)
         tx_hash = self.w3_priv.eth.send_raw_transaction(signed.raw_transaction)
         receipt = self.w3_pub.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
-        if receipt['status'] != 1: raise Exception("Arb DEX revert")
+        if receipt['status'] != 1:
+            raise Exception("Arb DEX revert")
         buy = await self.okx.create_market_buy_order('ETH/USDC', expected_usdc)
         profit_eth = buy['filled'] - amount_eth
         cex_price = await self.get_cex_price()
@@ -225,13 +197,26 @@ class SolanaEngine:
         self.client = AsyncClient(SOL_RPC, commitment=Processed)
         self.keypair = keypair
         self.okx = None
-    async def get_jupiter_quote(self, amount_sol):
-        async with aiohttp.ClientSession() as session:
-            url = f"https://quote-api.jup.ag/v6/quote?inputMint={WSOL}&outputMint={USDC_SOL}&amount={int(amount_sol*1e9)}&slippageBps={MAX_SLIPPAGE*100}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                price = float(data['outAmount']) / 1e6 / amount_sol
-                return price, data
+    async def get_jupiter_quote(self, amount_sol, retries=3):
+        # Кастомный DNS резолвер (8.8.8.8) и таймаут
+        connector = aiohttp.TCPConnector(
+            resolver=aiohttp.resolver.AsyncResolver(nameservers=["8.8.8.8", "8.8.4.4"]),
+            ttl_dns_cache=300
+        )
+        for attempt in range(retries):
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    url = f"https://quote-api.jup.ag/v6/quote?inputMint={WSOL}&outputMint={USDC_SOL}&amount={int(amount_sol*1e9)}&slippageBps={MAX_SLIPPAGE*100}"
+                    async with session.get(url, timeout=10) as resp:
+                        data = await resp.json()
+                        price = float(data['outAmount']) / 1e6 / amount_sol
+                        return price, data
+            except Exception as e:
+                logger.warning(f"Jupiter quote attempt {attempt+1} failed: {e}")
+                if attempt == retries-1:
+                    raise
+                await asyncio.sleep(2)
+        raise Exception("Jupiter quote failed after retries")
     async def send_jito_bundle(self, swap_tx_bytes):
         tip_acc = Pubkey.from_string("Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY")
         tip_ix = system_transfer(self.keypair.pubkey(), tip_acc, JITO_TIP_LAMPORTS)
@@ -243,9 +228,10 @@ class SolanaEngine:
         bundle = [base64.b64encode(new_txn.serialize()).decode()]
         async with aiohttp.ClientSession() as session:
             payload = {"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[bundle,{"encoding":"base64"}]}
-            async with session.post(JITO_ENGINE, json=payload) as resp:
+            async with session.post(JITO_ENGINE, json=payload, timeout=10) as resp:
                 res = await resp.json()
-                if 'error' in res: raise Exception(f"Jito error: {res['error']}")
+                if 'error' in res:
+                    raise Exception(f"Jito error: {res['error']}")
         return True
     async def execute(self, amount_sol, dex_price):
         fresh_price, quote = await self.get_jupiter_quote(amount_sol)
@@ -253,7 +239,7 @@ class SolanaEngine:
             raise Exception("price changed")
         async with aiohttp.ClientSession() as session:
             payload = {"quoteResponse": quote, "userPublicKey": str(self.keypair.pubkey()), "wrapAndUnwrapSol": True}
-            async with session.post("https://quote-api.jup.ag/v6/swap", json=payload) as resp:
+            async with session.post("https://quote-api.jup.ag/v6/swap", json=payload, timeout=10) as resp:
                 swap_data = await resp.json()
                 tx_bytes = base64.b64decode(swap_data['swapTransaction'])
         await self.send_jito_bundle(tx_bytes)
@@ -274,7 +260,7 @@ async def main():
     trades_today = 0
     consecutive_losses = 0
     start_time = time.time()
-    await send_telegram("🚀 Orion-X Pro запущен на GitHub Actions (автопилот, таймаут 10 мин)")
+    await send_telegram("🚀 Orion-X Pro запущен на GitHub Actions (DNS fix, таймаут 10 мин)")
     okx = ccxt.okx({
         'apiKey': OKX_API_KEY,
         'secret': OKX_SECRET,
@@ -293,23 +279,22 @@ async def main():
 
     while True:
         try:
-            # Проверка превышения времени работы
+            # Проверка времени
             if time.time() - start_time > MAX_RUNTIME_SECONDS:
-                await send_telegram("⏱️ Достигнут лимит времени работы (10 мин), завершаем работу для GitHub Actions")
+                await send_telegram("⏱️ Лимит времени 10 мин, завершение")
                 logger.info("Timeout reached, exiting")
                 break
 
             if time.time() - fee_mgr.last_update > 3600:
                 await fee_mgr.update_fees()
-            # Аварийная остановка
             if total_profit < -MAX_DAILY_LOSS:
-                await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: убыток ${total_profit:.2f} превысил лимит")
+                await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: убыток ${total_profit:.2f}")
                 break
             if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: {MAX_CONSECUTIVE_LOSSES} убыточных сделок подряд")
+                await send_telegram(f"⚠️ АВАРИЙНАЯ ОСТАНОВКА: {MAX_CONSECUTIVE_LOSSES} убыточных сделок")
                 break
 
-            # Arbitrum
+            # ----- Arbitrum -----
             cex_eth = await arb.get_cex_price()
             dex_eth, _ = await arb.get_dex_price(TRADE_ETH)
             if dex_eth and cex_eth and dex_eth > cex_eth:
@@ -330,35 +315,39 @@ async def main():
                     await send_telegram(msg)
                     await asyncio.sleep(2)
 
-            # Solana
-            cex_sol = await sol.get_cex_price()
-            dex_sol, _ = await sol.get_jupiter_quote(TRADE_SOL)
-            if dex_sol and cex_sol and dex_sol > cex_sol:
-                gas_usd = await sol.get_gas_price_usd()
-                base = fee_mgr.calc_min_spread_sol(gas_usd, cex_sol)
-                min_spread = adapt_sol.get(base)
-                cur_spread = (dex_sol - cex_sol)/cex_sol*100
-                if cur_spread >= min_spread:
-                    profit = await sol.execute(TRADE_SOL, dex_sol)
-                    total_profit += profit
-                    trades_today += 1
-                    adapt_sol.trades_today = trades_today
-                    adapt_sol.update(profit > 0)
-                    if profit > 0: consecutive_losses = 0
-                    else: consecutive_losses += 1
-                    msg = f"✅ SOL +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
-                    logger.info(msg)
-                    await send_telegram(msg)
-                    await asyncio.sleep(2)
+            # ----- Solana (с защитой от DNS ошибок) -----
+            try:
+                cex_sol = await sol.get_cex_price()
+                dex_sol, _ = await sol.get_jupiter_quote(TRADE_SOL)
+                if dex_sol and cex_sol and dex_sol > cex_sol:
+                    gas_usd = await sol.get_gas_price_usd()
+                    base = fee_mgr.calc_min_spread_sol(gas_usd, cex_sol)
+                    min_spread = adapt_sol.get(base)
+                    cur_spread = (dex_sol - cex_sol)/cex_sol*100
+                    if cur_spread >= min_spread:
+                        profit = await sol.execute(TRADE_SOL, dex_sol)
+                        total_profit += profit
+                        trades_today += 1
+                        adapt_sol.trades_today = trades_today
+                        adapt_sol.update(profit > 0)
+                        if profit > 0: consecutive_losses = 0
+                        else: consecutive_losses += 1
+                        msg = f"✅ SOL +${profit:.2f} | Всего ${total_profit:.2f} | сделок {trades_today}"
+                        logger.info(msg)
+                        await send_telegram(msg)
+                        await asyncio.sleep(2)
+            except Exception as sol_err:
+                logger.warning(f"Solana временная ошибка (пропускаем): {sol_err}")
 
             await asyncio.sleep(1.5)
+
         except Exception as e:
             err = f"⚠️ Ошибка: {e}"
             logger.error(err)
             await send_telegram(err)
             await asyncio.sleep(5)
 
-    # Закрытие подключений
+    # Закрытие ресурсов
     await okx.close()
     await arb.w3_priv.provider.cache_clear()
     await sol.client.close()
